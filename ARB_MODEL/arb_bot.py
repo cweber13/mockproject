@@ -65,10 +65,31 @@ class ArbOpportunity:
 #  KALSHI CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
 class KalshiClient:
+    """
+    Authenticates via RSA private key (recommended) or email/password.
+
+    RSA key setup:
+      1. Kalshi dashboard → Settings → API Access → Generate Key
+      2. Save the downloaded .pem file somewhere safe (e.g. ~/.kalshi_key.pem)
+      3. Add to .env:
+            KALSHI_KEY_ID=your-key-uuid
+            KALSHI_KEY_PATH=/home/you/.kalshi_key.pem
+    """
+
     def __init__(self):
         self.session = requests.Session()
+        self._key_id  = None
+        self._privkey = None
 
-    def login(self, email: str, password: str) -> None:
+    def login_with_key(self, key_id: str, key_path: str) -> None:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+        with open(key_path, "rb") as f:
+            self._privkey = serialization.load_pem_private_key(f.read(), password=None)
+        self._key_id = key_id
+        log.info("Kalshi: RSA key loaded  key_id=%s", key_id)
+
+    def login_with_password(self, email: str, password: str) -> None:
         resp = self.session.post(
             f"{KALSHI_BASE}/login",
             json={"email": email, "password": password},
@@ -78,19 +99,49 @@ class KalshiClient:
         self.session.headers.update({"Authorization": f"Bearer {token}"})
         log.info("Kalshi: logged in as %s", email)
 
+    def _signed_headers(self, method: str, path: str) -> dict:
+        """Build RSA-signed request headers required by Kalshi API key auth."""
+        import base64, time as _time
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding as _padding
+        ts  = str(int(_time.time() * 1000))
+        msg = (ts + method.upper() + path).encode()
+        sig = self._privkey.sign(msg, _padding.PKCS1v15(), hashes.SHA256())
+        return {
+            "KALSHI-ACCESS-KEY":       self._key_id,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+        }
+
+    def _get(self, path: str, params: dict = None) -> requests.Response:
+        url = KALSHI_BASE + path
+        if self._privkey:
+            resp = self.session.get(url, params=params,
+                                    headers=self._signed_headers("GET", path))
+        else:
+            resp = self.session.get(url, params=params)
+        resp.raise_for_status()
+        return resp
+
+    def _post(self, path: str, json: dict) -> requests.Response:
+        url = KALSHI_BASE + path
+        if self._privkey:
+            resp = self.session.post(url, json=json,
+                                     headers=self._signed_headers("POST", path))
+        else:
+            resp = self.session.post(url, json=json)
+        resp.raise_for_status()
+        return resp
+
     def get_markets(self, limit: int = 200, cursor: str = "") -> dict:
         params = {"limit": limit, "status": "open"}
         if cursor:
             params["cursor"] = cursor
-        resp = self.session.get(f"{KALSHI_BASE}/markets", params=params)
-        resp.raise_for_status()
-        return resp.json()
+        return self._get("/markets", params).json()
 
     def best_ask(self, ticker: str, side: str) -> Optional[float]:
         try:
-            resp = self.session.get(f"{KALSHI_BASE}/markets/{ticker}/orderbook")
-            resp.raise_for_status()
-            ob   = resp.json().get("orderbook", {})
+            ob   = self._get(f"/markets/{ticker}/orderbook").json().get("orderbook", {})
             asks = ob.get(f"{side}_ask", [])
             return asks[0][0] / 100 if asks else None
         except Exception as e:
@@ -106,9 +157,7 @@ class KalshiClient:
             ("yes_price" if side == "yes" else "no_price"): limit_price,
             "action": "buy",
         }
-        resp = self.session.post(f"{KALSHI_BASE}/portfolio/orders", json=payload)
-        resp.raise_for_status()
-        return resp.json()
+        return self._post("/portfolio/orders", payload).json()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  POLYMARKET CLIENT
@@ -155,22 +204,86 @@ class PolymarketClient:
 # ══════════════════════════════════════════════════════════════════════════════
 #  MOCK CLIENTS  (used when LIVE_MODE = False)
 # ══════════════════════════════════════════════════════════════════════════════
+# ── Crypto binary contracts mirroring real Kalshi/Polymarket listings ──────────
+# Format: Kalshi ticker | Poly equivalent
+#
+#  BTC daily close brackets  (Kalshi: KXBTCD-YYMMDD-TXXXXX)
+#  ETH daily close brackets  (Kalshi: KXETHUSD-YYMMDD-TXXXXX)
+#  Crypto up/down by EOD     (both platforms offer these)
+#
+# Prices below simulate a realistic session with a few exploitable spreads.
+# Kalshi prices tend to lag Polymarket on fast-moving crypto events — that
+# lag is where most real arb lives.
+
 MOCK_MARKETS = [
-    {"description": "Will the Fed cut rates in May 2025?",
-     "kalshi_ticker": "FED-25MAY-CUT",
-     "kalshi_yes": 0.41, "kalshi_no": 0.62, "poly_yes": 0.55, "poly_no": 0.48},
-    {"description": "Will BTC close above $100k on Dec 31 2025?",
-     "kalshi_ticker": "BTC-100K-DEC25",
-     "kalshi_yes": 0.52, "kalshi_no": 0.50, "poly_yes": 0.53, "poly_no": 0.49},
-    {"description": "Will the US enter a recession in 2025?",
-     "kalshi_ticker": "US-RECESSION-25",
-     "kalshi_yes": 0.47, "kalshi_no": 0.55, "poly_yes": 0.38, "poly_no": 0.64},
-    {"description": "Will Apple release an AR headset in 2025?",
-     "kalshi_ticker": "AAPL-AR-2025",
-     "kalshi_yes": 0.30, "kalshi_no": 0.72, "poly_yes": 0.29, "poly_no": 0.73},
-    {"description": "Will US unemployment exceed 5% in Q3 2025?",
-     "kalshi_ticker": "UNEMP-5PCT-Q3",
-     "kalshi_yes": 0.33, "kalshi_no": 0.69, "poly_yes": 0.44, "poly_no": 0.58},
+    # ── Bitcoin daily price bracket ────────────────────────────────────────────
+    {
+        "description":    "Will BTC close above $82,000 today?",
+        "kalshi_ticker":  "KXBTCD-250401-T82000",
+        # Kalshi is slow to reprice after a BTC pump → arb dir B
+        "kalshi_yes": 0.38, "kalshi_no": 0.65,
+        "poly_yes":   0.54, "poly_no":   0.48,
+    },
+    {
+        "description":    "Will BTC close above $85,000 today?",
+        "kalshi_ticker":  "KXBTCD-250401-T85000",
+        # Tight — no arb after fees
+        "kalshi_yes": 0.22, "kalshi_no": 0.79,
+        "poly_yes":   0.23, "poly_no":   0.78,
+    },
+    {
+        "description":    "Will BTC close above $80,000 today?",
+        "kalshi_ticker":  "KXBTCD-250401-T80000",
+        # Poly pricing higher YES → arb dir A
+        "kalshi_yes": 0.58, "kalshi_no": 0.44,
+        "poly_yes":   0.42, "poly_no":   0.61,
+    },
+    # ── Bitcoin weekly ─────────────────────────────────────────────────────────
+    {
+        "description":    "Will BTC be above $90,000 by end of this week?",
+        "kalshi_ticker":  "KXBTCD-250406-T90000",
+        # No arb — markets aligned
+        "kalshi_yes": 0.31, "kalshi_no": 0.71,
+        "poly_yes":   0.32, "poly_no":   0.70,
+    },
+    {
+        "description":    "Will BTC be above $75,000 by end of this week?",
+        "kalshi_ticker":  "KXBTCD-250406-T75000",
+        # Kalshi NO mispriced low → arb dir A
+        "kalshi_yes": 0.72, "kalshi_no": 0.22,
+        "poly_yes":   0.39, "poly_no":   0.63,
+    },
+    # ── Ethereum daily ─────────────────────────────────────────────────────────
+    {
+        "description":    "Will ETH close above $1,800 today?",
+        "kalshi_ticker":  "KXETHUSD-250401-T1800",
+        # Arb dir B — Kalshi YES cheap
+        "kalshi_yes": 0.35, "kalshi_no": 0.67,
+        "poly_yes":   0.51, "poly_no":   0.51,
+    },
+    {
+        "description":    "Will ETH close above $2,000 today?",
+        "kalshi_ticker":  "KXETHUSD-250401-T2000",
+        # Tight — borderline after fees
+        "kalshi_yes": 0.19, "kalshi_no": 0.82,
+        "poly_yes":   0.20, "poly_no":   0.81,
+    },
+    # ── Solana ─────────────────────────────────────────────────────────────────
+    {
+        "description":    "Will SOL close above $130 today?",
+        "kalshi_ticker":  "KXSOLUSD-250401-T130",
+        # Clear arb — Poly YES low, Kalshi NO low
+        "kalshi_yes": 0.44, "kalshi_no": 0.49,
+        "poly_yes":   0.36, "poly_no":   0.66,
+    },
+    # ── Bitcoin ATH / milestone ────────────────────────────────────────────────
+    {
+        "description":    "Will BTC hit a new all-time high in April 2025?",
+        "kalshi_ticker":  "BTC-ATH-APR25",
+        # No arb — efficient long-dated market
+        "kalshi_yes": 0.28, "kalshi_no": 0.74,
+        "poly_yes":   0.27, "poly_no":   0.74,
+    },
 ]
 
 class MockKalshiClient:
@@ -377,17 +490,29 @@ if __name__ == "__main__":
     print(f"  MIN_PROFIT={MIN_PROFIT_PCT*100:.0f}%  MAX_TRADE=${MAX_TRADE_USD}\n")
 
     if LIVE_MODE:
-        # ── Real clients ──────────────────────────────────────────────────────
+        # ── Kalshi — RSA key auth (preferred) ─────────────────────────────────
+        # Needs in .env:  KALSHI_KEY_ID  +  KALSHI_KEY_PATH
+        # Falls back to email/password if key not configured
         kalshi = KalshiClient()
-        kalshi.login(
-            email    = os.environ["KALSHI_EMAIL"],
-            password = os.environ["KALSHI_PASSWORD"],
-        )
+        if os.environ.get("KALSHI_KEY_ID") and os.environ.get("KALSHI_KEY_PATH"):
+            kalshi.login_with_key(
+                key_id   = os.environ["KALSHI_KEY_ID"],
+                key_path = os.environ["KALSHI_KEY_PATH"],
+            )
+        else:
+            kalshi.login_with_password(
+                email    = os.environ["KALSHI_EMAIL"],
+                password = os.environ["KALSHI_PASSWORD"],
+            )
+
+        # ── Polymarket — API key auth ──────────────────────────────────────────
+        # Needs in .env:  POLY_API_KEY  +  POLY_API_SECRET  +  POLY_PASSPHRASE
         poly = PolymarketClient(
             api_key    = os.environ["POLY_API_KEY"],
             api_secret = os.environ["POLY_API_SECRET"],
             passphrase = os.environ["POLY_PASSPHRASE"],
         )
+
         pairs = match_live_markets(kalshi, poly)
         run_scanner(kalshi, poly, pairs)          # runs forever until Ctrl+C
 
